@@ -16,6 +16,74 @@ import (
 	"github.com/boltdb/bolt/cmd/bolt"
 )
 
+func TestMainProcess(t *testing.T) {
+	db, err := bolt.Open("my.db", 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// start a writable transaction
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	// use the transaction
+	bucket, err := tx.CreateBucketIfNotExists([]byte("MyBucket"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket.Put([]byte("foo"), []byte("bar"))
+
+	// Commit the transaction and check for error
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMainProcess1(t *testing.T) {
+	db, err := bolt.Open("my1.db", 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer db.Close()
+
+	err = db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("user"))
+		if err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("hello"), []byte("word")); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("user"))
+
+		val := bucket.Get([]byte("hello"))
+		t.Logf("fetch the val: %s", val)
+
+		val = bucket.Get([]byte("hello2"))
+		t.Logf("fetch the val: %s", val)
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("db.View err: %s", err.Error())
+	}
+
+
+}
+
 // Ensure the "info" command can print information about a database.
 func TestInfoCommand_Run(t *testing.T) {
 	db := MustOpen(0666, nil)

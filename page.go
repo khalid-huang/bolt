@@ -28,10 +28,15 @@ const (
 type pgid uint64
 
 type page struct {
+	// 页id，8字节
 	id       pgid
+	// flags: 页类型，可以是分支，叶子节点，元信息，空闲列表  2字节
 	flags    uint16
+	// 个数 2字节，统计叶子节点、非叶子节点、空闲列表页的个数
 	count    uint16
+	// 4字节，数据是否有溢出，主要在空闲列表上有用
 	overflow uint32
+	// 真实的数据
 	ptr      uintptr
 }
 

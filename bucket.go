@@ -34,7 +34,7 @@ const DefaultFillPercent = 0.5
 
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
-	*bucket
+	*bucket  // 在内联时bucket主要用来存储其桶的value并在后面拼接所有的元素，即所谓的内联
 	tx       *Tx                // the associated transaction
 	buckets  map[string]*Bucket // subbucket cache
 	page     *page              // inline page reference

@@ -9,15 +9,18 @@ import (
 
 // node represents an in-memory, deserialized page.
 type node struct {
-	bucket     *Bucket
-	isLeaf     bool
-	unbalanced bool
-	spilled    bool
-	key        []byte
-	pgid       pgid
-	parent     *node
-	children   nodes
-	inodes     inodes
+	bucket     *Bucket // 节点所在桶的指针
+	isLeaf     bool // 是否为叶子节点
+	// 调整和维护B+树时需要的
+	unbalanced bool // 是否需要进行合并
+	spilled    bool // 是否需要进场拆分
+
+	key        []byte // 锁包含第一个元素的key，boltdb的索引节点的指针和索引值数量是一样的
+	pgid       pgid // 对应的页id
+
+	parent     *node // 父节点指针
+	children   nodes // 孩子节点
+	inodes     inodes // 所存元素的元信息；对于分支节点是 key+pgid 数组(也就是索引信息)，对于叶子节点是 kv 数组
 }
 
 // root returns the top-level node this node is attached to.
@@ -112,7 +115,11 @@ func (n *node) prevSibling() *node {
 	return n.parent.childAt(index - 1)
 }
 
+// 所有的数据新增都发生在叶子节点，如果新增数据后 B+ 树不平衡，之后会通过 node.spill 来进行拆分调整
 // put inserts a key/value.
+// 在插入的时候，oldKey等于newKey
+// spill的时候，old不等于newKey
+//
 func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	if pgid >= n.bucket.tx.meta.pgid {
 		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", pgid, n.bucket.tx.meta.pgid))
@@ -123,6 +130,7 @@ func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	}
 
 	// Find insertion index.
+	// 二分查找找插入位置
 	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].key, oldKey) != -1 })
 
 	// Add capacity and shift nodes if we don't have an exact match and need to insert.
@@ -356,6 +364,7 @@ func (n *node) spill() error {
 	n.children = nil
 
 	// Split nodes into appropriate sizes. The first node will always be n.
+	//
 	var nodes = n.split(tx.db.pageSize)
 	for _, node := range nodes {
 		// Add node's page to the freelist if it's not new.
@@ -379,9 +388,9 @@ func (n *node) spill() error {
 		node.spilled = true
 
 		// Insert into parent inodes.
-		if node.parent != nil {
-			var key = node.key
-			if key == nil {
+		if node.parent != nil { // 如果不是根节点
+			var key = node.key // split后，最左边node
+			if key == nil { // split后，非最左边node
 				key = node.inodes[0].key
 			}
 
