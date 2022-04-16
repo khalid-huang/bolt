@@ -163,6 +163,9 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	db.AllocSize = DefaultAllocSize
 
 	flag := os.O_RDWR
+	// 根据ReadOnly参数决定是否以进程独占的方式打开文件
+	// 如果以只读方式访问数据库文件，则不同进程可以共享读该文件；如果以读写方式访问数据库文件，则文件锁将被独占，
+	// 其他进程无法同时以读写方式访问该数据库文件，这是为了防止多个进程同时修改文件；
 	if options.ReadOnly {
 		flag = os.O_RDONLY
 		db.readOnly = true
@@ -189,9 +192,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// Default values for test hooks
+	// 初始化写文件函数
 	db.ops.writeAt = db.file.WriteAt
 
 	// Initialize the database if it doesn't exist.
+	// 读数据库文件，如果文件大小为零，则对db进行初始化；如果大小不为零，则试图读取前4K个字节来确定当前数据库的pageSize
 	if info, err := db.file.Stat(); err != nil {
 		return nil, err
 	} else if info.Size() == 0 {
@@ -227,12 +232,14 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// Memory map the data file.
+	// 通过mmap对打开的数据库文件进行内存映射，并初始化db对象中的meta指针
 	if err := db.mmap(options.InitialMmapSize); err != nil {
 		_ = db.close()
 		return nil, err
 	}
 
 	// Read in the freelist.
+	// 读数据库文件的freelist页，并初始化db对象中的freelist列表，freelist列表中记录着数据库文件中的空闲页
 	db.freelist = newFreelist()
 	db.freelist.read(db.page(db.meta().freelist))
 
@@ -344,8 +351,9 @@ func (db *DB) init() error {
 	// Set the page size to the OS page size.
 	db.pageSize = os.Getpagesize()
 
-	// Create two meta pages on a buffer.
+	// 分配4个page大小的buffer
 	buf := make([]byte, db.pageSize*4)
+	// Create two meta pages on a buffer.
 	for i := 0; i < 2; i++ {
 		p := db.pageInBuffer(buf[:], pgid(i))
 		p.id = pgid(i)

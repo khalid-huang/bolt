@@ -149,6 +149,7 @@ func (c *Cursor) Delete() error {
 	return nil
 }
 
+// 移动游标到seek位置
 // seek moves the cursor to a given key and returns it.
 // If the key does not exist then the next key is used.
 func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
