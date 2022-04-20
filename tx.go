@@ -227,6 +227,7 @@ func (tx *Tx) Commit() error {
 
 	// Write dirty pages to disk.
 	startTime = time.Now()
+	// 将当前transaction分配的脏页写入磁盘
 	if err := tx.write(); err != nil {
 		tx.rollback()
 		return err
@@ -250,6 +251,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	// Write meta to disk.
+	// 将当前transaction的meta写入DB的meta页，因为进行读写操作后，meta中的txid已经改变，root、freelist和pgid也有可能已经更新了;
 	if err := tx.writeMeta(); err != nil {
 		tx.rollback()
 		return err
@@ -260,6 +262,7 @@ func (tx *Tx) Commit() error {
 	tx.close()
 
 	// Execute commit handlers now that the locks have been removed.
+	// 回调commit handlers
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}

@@ -656,6 +656,7 @@ func (b *Bucket) write() []byte {
 	return value
 }
 
+// 先对Bucket中缓存的node进行再平衡操作，然后对所有子Bucket递归调用rebalance()
 // rebalance attempts to balance all nodes.
 func (b *Bucket) rebalance() {
 	for _, n := range b.nodes {
