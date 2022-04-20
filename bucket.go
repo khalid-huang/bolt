@@ -167,6 +167,11 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 // CreateBucket creates a new bucket at the given key and returns the new bucket.
 // Returns an error if the key already exists, if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
+// 整个Bucket的创建流程：
+// 	1. 根据Bucket的名字(key)搜索父Bucket（最初始的就是根Bucket），以确定表示Bucket的K/V对的插入位置;
+//	2. 创建空的内置Bucket，并将它序列化成byte slice，以作为Bucket的Value;
+//	3. 将表示Bucket的K/V对(即inode的flags为bucketLeafFlag(0x01))写入父Bucket的叶子节点;
+//	4. 通过Bucket的Bucket(name []byte)在父Bucket中查找刚刚创建的子Bucket，在了解了Bucket通过Cursor进行查找和遍历的过程后，读者可以尝试自行分析这一过程，我们在后续文中还会介绍Bucket的Get()方法，与此类似。
 func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	if b.tx.db == nil {
 		return nil, ErrTxClosed
@@ -180,6 +185,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	// 为当前Bucket创建游标
 	c := b.Cursor()
 	// 查找Key并移动游标，确定其应该插入的位置
+	// 在查找结束后，如果未找到key，即key指向叶子结点的结尾处，则它返回空；如果找到则返回K/V对。需要注意的是，在再次调用Cursor的seek()方法移动游标之前，游标一直位于上次seek()调用后的位置。
 	k, _, flags := c.seek(key)
 
 	// Return an error if there is an existing key.
@@ -190,16 +196,21 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		return nil, ErrIncompatibleValue
 	}
 
+	// 创建了一个内置的子Bucket，它的Bucket头bucket中的root为0
 	// Create empty, inline bucket.
 	var bucket = Bucket{
 		bucket:      &bucket{},
 		rootNode:    &node{isLeaf: true},
 		FillPercent: DefaultFillPercent,
 	}
+	// 通过Bucket的write方法将内置Bucket序列化，我们可以通过它了解内置Bucket式如何作为Value存在于页上的
 	var value = bucket.write()
 
 	// Insert into node.
+	// 内置Bucket就是将Bucket头和其根节点作为Value存于页框上，而其头中字段均为0
 	key = cloneBytes(key)
+	// 将刚创建的子Bucket插入游标位置
+	// 将内容写入
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
 	// Since subbuckets are not allowed on inline buckets, we need to
@@ -214,6 +225,10 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist and returns a reference to it.
 // Returns an error if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
+// 向Bucket添加K/V的过程与创建Bucket时的过程极其相似，因为创建Bucket实际上就是向父Bucket添加一个标识为Bucket的K/V对而已。
+// 不同的是，这里作了一个保护，即当欲插入的Key与当前Bucket中已有的一个子Bucket的Key相同时，会拒绝写入，
+// 从而保护嵌套的子Bucket的引用不会被擦除，防止子Bucket变成孤儿。当然，我们也可以调用新创建的子Bucket的CreateBucket()方法来创建
+// 孙Bucket，然后向孙Bucket中写入K/V对，其过程与我们上述从根Bucket创建子Bucket的过程是一致的
 func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
 	child, err := b.CreateBucket(key)
 	if err == ErrBucketExists {
@@ -712,6 +727,9 @@ func (b *Bucket) dereference() {
 	}
 }
 
+// Bucket的pageNode()方法的思想是: 从Bucket缓存的nodes中查找对应pgid的node，若有则返回node，page为空；若未找到，
+// 再从Bucket所属的Transaction申请过的page的集合(Tx的pages字段)中查找，有则返回该page，node为空；
+// 若Transaction中的page缓存中仍然没有，则直接从DB的内存映射中查找该页，并返回。总之，pageNode()就是根据pgid找到node或者page。
 // pageNode returns the in-memory node, if it exists.
 // Otherwise returns the underlying page.
 func (b *Bucket) pageNode(id pgid) (*page, *node) {

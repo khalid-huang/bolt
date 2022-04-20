@@ -168,6 +168,8 @@ func (tx *Tx) Commit() error {
 
 	// Rebalance nodes which have had deletions.
 	var startTime = time.Now()
+	// 对根Bucket进行再平衡，这里的根Bucket也是整个DB的根Bucket，然而从根Bucket进行再平衡并不是要对DB中所有节点进行操作，
+	// 而且对当前读写Transaction访问过的Bucket中的有删除操作的节点进行再平衡
 	tx.root.rebalance()
 	if tx.stats.Rebalance > 0 {
 		tx.stats.RebalanceTime += time.Since(startTime)
@@ -175,6 +177,7 @@ func (tx *Tx) Commit() error {
 
 	// spill data onto dirty pages.
 	startTime = time.Now()
+	// 对根Bucket进行溢出操作，同样地，也是对访问过的子Bucket进行溢出操作，而且只有当节点中Key数量确实超限时才会分裂节点
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
 		return err
@@ -182,12 +185,15 @@ func (tx *Tx) Commit() error {
 	tx.stats.SpillTime += time.Since(startTime)
 
 	// Free the old root bucket.
+	// 进行在平衡与分裂后，根Bucket的根节点可能发送了变化，所以需要更新下根Bucket的根节点的页号，且最终会写入DB的meta page
 	tx.meta.root.root = tx.root.root
 
-	opgid := tx.meta.pgid
+	opgid := tx.meta.pgid // (4)
 
-	// Free the freelist and allocate new pages for it. This will overestimate
-	// the size of the freelist but not underestimate the size (which would be bad).
+	// 下面的代码是更新DB的freeList Page；这里为什么对freelist做了释放后重新分配页并写入呢？
+	// 这是因为下面的tx.write写磁盘的时候，只会向磁盘写入由当前Transaction分配并写入过的页(脏页)，
+	// 由于freeList page最初是在db初始化过程中分配的页，如果不在Transaction内释放并重新分配，
+	// 那么freeList page将没有机会被更新到DB文件中，这里的实现并不很优雅
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -200,9 +206,20 @@ func (tx *Tx) Commit() error {
 	}
 	tx.meta.freelist = p.id
 
+	// 这里的代码4,7,8是为了实现如下的逻辑：只有当映射入内存的页数增加时，才调用db.grow()来刷新磁盘文件的元数据，以及时更新文件大小信息。
+	// 这里需要解释一下: 我们前面介绍过，windows平台下db.mmap()调用会通过ftruncate系统调用来增加文件大小，而linux平台则没有，
+	// 但linux平台会在db.grow()中调用ftruncate更新文件大小。我们前面介绍过，BoltDB写数据时不是通过mmap内存映射写文件的，
+	// 而是直接通过fwrite和fdatesync系统调用 向文件系统写文件。当向文件写入数据时，文件系统上该文件结点的元数据可能不会立即刷新，
+	// 导致文件的size不会立即更新，当进程crash时，可能会出现写文件结束但文件大小没有更新的情况，所以为了防止这种情况出现，在写DB文件之前，
+	// 无论是windows还是linux平台，都会通过ftruncate系统调用来增加文件大小；但是linux平台为什么不在每次mmap的时候调用ftruncate来更新文件大小呢？
+	// 这里是一个优化措施，因为频繁地ftruncate系统调用会影响性能，这里的优化方式是: 只有当：1) 重新分配freeListPage时，没有空闲页，
+	// 这里大家可能会有疑惑，freeListPage不是刚刚通过freelist的free()方法释放过它所占用的页吗，还会有重新分配时没有空闲页的情况吗？
+	// 实际上，free()过并不是真正释放页，而是将页标记为pending，要等创建下一次读写Transaction时才会被真正回收(大家可以查看freeist的free()
+	// 和release()以及DB的beginRWTx()方法中最后一节代码了解具体逻辑)；2) remmap的长度大于文件实际大小时，才会调用ftruncate来增加文件大小，
+	// 且当映射文件大小大于16M后，每次增加文件大小时会比实际需要的文件大小多增加16M
 	// If the high water mark has moved up then attempt to grow the database.
-	if tx.meta.pgid > opgid {
-		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil {
+	if tx.meta.pgid > opgid { // (7)
+		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil { // (8)
 			tx.rollback()
 			return err
 		}

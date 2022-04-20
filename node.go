@@ -119,7 +119,6 @@ func (n *node) prevSibling() *node {
 // put inserts a key/value.
 // 在插入的时候，oldKey等于newKey
 // spill的时候，old不等于newKey
-//
 func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	if pgid >= n.bucket.tx.meta.pgid {
 		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", pgid, n.bucket.tx.meta.pgid))
@@ -131,8 +130,12 @@ func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 
 	// Find insertion index.
 	// 二分查找找插入位置
+	// 先查找oldKey以确定插入的位置。要么是正好找到oldKey，则插入位置就是oldKey的位置，实际上是替换；要么node中不含有oldKey，
+	// 则插入位置就是第一个大于oldKey的前一个key的位置或者是节点结尾;
 	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].key, oldKey) != -1 })
 
+	// 如果找到oldKey，则直接用newKey和value替代原来的oldKey和old value；
+	// 如果未找到oldKey，则向node中添加一个inode，并将插入位置后的所有inode向后移一位，以实现插入新的inode;
 	// Add capacity and shift nodes if we don't have an exact match and need to insert.
 	exact := (len(n.inodes) > 0 && index < len(n.inodes) && bytes.Equal(n.inodes[index].key, oldKey))
 	if !exact {

@@ -262,22 +262,30 @@ func (c *Cursor) search(key []byte, pgid pgid) {
 
 	// 创建一个elemRef对象，它指向pgid锁指定的B+Tree节点，index为0
 	e := elemRef{page: p, node: n}
+	// 将刚创建的elemRef对象添加到stack的尾部，实现将Cursor移动到相应的B+Tree节点
 	c.stack = append(c.stack, e)
 
 	// If we're on a leaf page/node then find the specific node.
+	// 如果游标指向叶子节点，则在节点内查找
+	// 这里也是递归掉员工的结束条件，也就是游标最终移动到一个叶子节点处，进入c.nsearch(key)
 	if e.isLeaf() {
 		c.nsearch(key)
 		return
 	}
 
 	if n != nil {
+		// 如果游标指向根节点或者内节点，且pgid有对应的node对象，开始在非叶子节点中查找，以确定子节点并进行递归查找;
 		c.searchNode(key, n)
 		return
 	}
+	// 如果游标指向根节点或者内节点，且pgid没有对应的node，只能从page中直接读branchPageElement，z开始在非叶子节点中查找，以确定子节点并进行递归查找
 	c.searchPage(key, p)
 }
 
+// 在当前节点n查找指定的key
 func (c *Cursor) searchNode(key []byte, n *node) {
+	// 对节点中inodes进行有序查找(Go中sort.Search()使用二分法查找)，结果要么是正好找到key，
+	// 即exact=true且ret=0；要么是找到比key大的最小inode(即ret=1)或者所有inodes的key均小于目标key;
 	var exact bool
 	index := sort.Search(len(n.inodes), func(i int) bool {
 		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
@@ -288,12 +296,15 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 		}
 		return ret != -1
 	})
+	// 如果查找结果是上述的第二情况，则将结果索引值减1，因为欲查找的key肯定位于前一个Pointer对应的子节点或子树中
 	if !exact && index > 0 {
 		index--
 	}
+	// 将stack中的最后一个elemRef元素中的index置为查找结果索引值，即将游标移动到所指节点中具体的inode处;
 	c.stack[len(c.stack)-1].index = index
 
 	// Recursively search to the next page.
+	// 从inode记录的pgid(可以理解为Pointer)对应的子节点处开始递归查找;
 	c.search(key, n.inodes[index].pgid)
 }
 
@@ -326,6 +337,7 @@ func (c *Cursor) nsearch(key []byte) {
 	p, n := e.page, e.node
 
 	// If we have a node then search its inodes.
+	// 如果节点的node存在，在node内进行有序查找，结果为正好找到key或者未找到，未找到时index位于节点结尾处;
 	if n != nil {
 		index := sort.Search(len(n.inodes), func(i int) bool {
 			return bytes.Compare(n.inodes[i].key, key) != -1
@@ -334,11 +346,14 @@ func (c *Cursor) nsearch(key []byte) {
 		return
 	}
 
+	// 如果是page，则在page内进行有序查找，结果也是正好找到key或者未找到，未找到时index位于节点结尾于
 	// If we have a page then search its leaf elements.
 	inodes := p.leafPageElements()
 	index := sort.Search(int(p.count), func(i int) bool {
 		return bytes.Compare(inodes[i].key(), key) != -1
 	})
+
+	// 将当前游标元素的index置为刚刚得到的查找结果索引值，即把游标移动到key所在节点的具体inode处或者结尾处;
 	e.index = index
 }
 
@@ -360,6 +375,9 @@ func (c *Cursor) keyValue() ([]byte, []byte, uint32) {
 	return elem.key(), elem.value(), elem.flags
 }
 
+// 如果当前游标指向了一个叶子节点，且节点已经实例化为node，则直接返回该node；否则，从根节点处沿Cursor的查找路径将沿途的所有节点中
+// 未实例化的节点实例化成node，并返回最后节点的node。实际上最后的节点总是叶子节点，因为B+Tree的Key全部位于叶子节点，而内节点只用来索引，
+// 所以Cursor在seek()时，总会遍历到叶子节点。也就是说，c.node()总是返回当前游标指向的叶子节点的node引用
 // node returns the node that the cursor is currently positioned on.
 func (c *Cursor) node() *node {
 	_assert(len(c.stack) > 0, "accessing a node with a zero-length cursor stack")
