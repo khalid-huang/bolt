@@ -12,8 +12,8 @@ type node struct {
 	bucket     *Bucket // 节点所在桶的指针
 	isLeaf     bool // 是否为叶子节点
 	// 调整和维护B+树时需要的
-	unbalanced bool // 是否需要进行合并
-	spilled    bool // 是否需要进场拆分
+	unbalanced bool // 是否需要进行合并，当节点有KV对被删除时，改值设为true
+	spilled    bool // 是否需要进场拆分，指示当前node是否已经溢出(spill)，node溢出是指当node的size超过页大小，即一页无法存node中所有K/V对时，节点会分裂成多个node，以保证每个node的size小于页大小，分裂后产生新的node会增加父node的size，故父node也可能需要分裂；已经溢出过的node不需要再分裂;
 
 	key        []byte // 锁包含第一个元素的key，boltdb的索引节点的指针和索引值数量是一样的
 	pgid       pgid // 对应的页id
@@ -198,6 +198,7 @@ func (n *node) read(p *page) {
 // write writes the items onto one or more pages.
 func (n *node) write(p *page) {
 	// Initialize page.
+	// 根据node是否是叶子节点确定page是leafPage还是branchPage
 	if n.isLeaf {
 		p.flags |= leafPageFlag
 	} else {
@@ -215,13 +216,23 @@ func (n *node) write(p *page) {
 	}
 
 	// Loop over each item and write it to the page.
+	// 指向elements的结尾处，而且elements是从页正文开始存的
 	b := (*[maxAllocSize]byte)(unsafe.Pointer(&p.ptr))[n.pageElementSize()*len(n.inodes):]
+	// 通过for循环将所有kv记录顺序写入页
+	// 通过上面的代码知道，页中存储K/V是以Key、Value交替连续存储的，所有的K/V对是在页中的elements结构结尾处存储，
+	// 且每个element通过pos指向自己对应的K/V对，pos的值即是K/V对相对element起始位置的偏移；需要说明的是，
+	// B+Tree中的内结点并不存真正的K/V对，它只存Key用于查找，故branch page中实际上没有存Key的Value，
+	// 所以branchPageElement中并没像leafPageElement那样定义了vsize，因为branchPageElement的vsize始终是0。
 	for i, item := range n.inodes {
 		_assert(len(item.key) > 0, "write: zero-length inode key")
 
-		// Write the page element.
+		// Write the page element
 		if n.isLeaf {
+			// 定义leafPageElement指针，指向page中第i个leafPageElement
+			// 当index=0，第一个leafPageElement是从p.ptr指向的位置开始存的，而且所有leafPageElement是连续存储的
 			elem := p.leafPageElement(uint16(i))
+			// pos的值为b[0]到当前leafPageElement的偏移
+			// 当i=0时，b[0]实际上就是页中最后一个element的结尾处。一次for循环，实际上就是写入一个element和一个K/V对。
 			elem.pos = uint32(uintptr(unsafe.Pointer(&b[0])) - uintptr(unsafe.Pointer(elem)))
 			elem.flags = item.flags
 			elem.ksize = uint32(len(item.key))
@@ -244,8 +255,10 @@ func (n *node) write(p *page) {
 		}
 
 		// Write data for the element to the end of the page.
+		// 将key写入b
 		copy(b[0:], item.key)
 		b = b[klen:]
+		// 将key写入
 		copy(b[0:], item.value)
 		b = b[vlen:]
 	}
@@ -604,10 +617,10 @@ func (s nodes) Less(i, j int) bool { return bytes.Compare(s[i].inodes[0].key, s[
 // It can be used to point to elements in a page or point
 // to an element which hasn't been added to a page yet.
 type inode struct {
-	flags uint32
-	pgid  pgid
-	key   []byte
-	value []byte
+	flags uint32 // 指明改KV对是否代表一个Bucket，如果是Bucket，则其值为1，否则为0
+	pgid  pgid // 根节点或内节点的子节点的pgid，可以理解为Pointer，请注意，叶子节点中该值无意义;
+	key   []byte // KV对中的Key
+	value []byte // KV对中的Value，非叶子节点中该值没有意义
 }
 
 type inodes []inode

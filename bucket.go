@@ -34,11 +34,17 @@ const DefaultFillPercent = 0.5
 
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
-	*bucket  // 在内联时bucket主要用来存储其桶的value并在后面拼接所有的元素，即所谓的内联
+	// Bucket的头，其中的root是Bucket根节点的页号，sequence是一个序列号，用于Bucket的序号生成器
+	*bucket
+	// tx: 当前Bucket所属的Transaction。请注意，Transaction与Bucket均是动态的概念，即内存中的对象，Bucket最终表示为BoltDB中的K/V记录
 	tx       *Tx                // the associated transaction
 	buckets  map[string]*Bucket // subbucket cache
+	// 内置(inline)Bucket的页引用，内置Bucket只有一个节点，就是根节点，且节点不存在独立的页面中，而是作为Bucket的Value存在父Bucket所在页上，页引用就是指向Value中的内置页
+	// 内存占用少的时候就不展开
 	page     *page              // inline page reference
+	// Bucket的根节点，也就是对于B+Tree的根节点
 	rootNode *node              // materialized node for the root page.
+	// bucket中的node集合
 	nodes    map[pgid]*node     // node cache
 
 	// Sets the threshold for filling nodes when they split. By default,
@@ -46,6 +52,9 @@ type Bucket struct {
 	// amount if you know that your write workloads are mostly append-only.
 	//
 	// This is non-persisted across transactions so it must be set in every Tx.
+	// Bucket中节点的填充百分比(或者占空比)。该值与B+Tree中节点的分裂有关系，当节点中Key的个数或者size超过整个node容量的某个百分比后，
+	// 节点必须分裂为两个节点，这是为了防止B+Tree中插入K/V时引发频繁的再平衡操作，所以注释中提到只有当确定大数多写入操作是向尾添加时，
+	// 这个值调大才有帮助。该值的默认值是50%;
 	FillPercent float64
 }
 
@@ -168,7 +177,9 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	}
 
 	// Move cursor to correct position.
+	// 为当前Bucket创建游标
 	c := b.Cursor()
+	// 查找Key并移动游标，确定其应该插入的位置
 	k, _, flags := c.seek(key)
 
 	// Return an error if there is an existing key.
@@ -194,6 +205,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	// Since subbuckets are not allowed on inline buckets, we need to
 	// dereference the inline page, if it exists. This will cause the bucket
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
+	// 因为当前Bucket包含了刚创建的子Bucket，它不会是内置Bucket;
 	b.page = nil
 
 	return b.Bucket(key), nil

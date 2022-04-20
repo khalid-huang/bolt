@@ -16,8 +16,8 @@ import (
 // and return unexpected keys and/or values. You must reposition your cursor
 // after mutating data.
 type Cursor struct {
-	bucket *Bucket
-	stack  []elemRef
+	bucket *Bucket // 要搜索的Bucket引用
+	stack  []elemRef // elemRef slice，用于记录游标的搜索路径，最后一个元素指向游标当前位置
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -156,7 +156,9 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	_assert(c.bucket.tx.db != nil, "tx closed")
 
 	// Start from root page/node and traverse to correct page.
+	// 通过清空stack，将游标复位
 	c.stack = c.stack[:0]
+	// 调用search方法从Bucket的根节点开始找
 	c.search(seek, c.bucket.root)
 	ref := &c.stack[len(c.stack)-1]
 
@@ -252,10 +254,13 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 
 // search recursively performs a binary search against a given page/node until it finds a given key.
 func (c *Cursor) search(key []byte, pgid pgid) {
+	// 根据pgid找到缓存在Bucket中的node或者还未实例化的page
 	p, n := c.bucket.pageNode(pgid)
 	if p != nil && (p.flags&(branchPageFlag|leafPageFlag)) == 0 {
 		panic(fmt.Sprintf("invalid page type: %d: %x", p.id, p.flags))
 	}
+
+	// 创建一个elemRef对象，它指向pgid锁指定的B+Tree节点，index为0
 	e := elemRef{page: p, node: n}
 	c.stack = append(c.stack, e)
 
@@ -378,10 +383,14 @@ func (c *Cursor) node() *node {
 }
 
 // elemRef represents a reference to an element on a given page/node.
+// 实际上指向B+ Tree的一个节点，节点有可能已经实例为node，也可能是未实例化的page
+// Bucket是内存中的动态对象，它缓存了node。Cursor在遍历B+Tree时，如果节点已经实例化成node，则elemRef中的node字段指向该node，
+// page字段为空；如果节点是未实例化的page，则elemRef中的page字段指向该page，node字段为空。elemRef通过page或者node指向B+Tree的一个节点，
+// 通过index进一步指向节点中的K/V对。Cursor在B+Tree上的移动过程就是将elemRef添加或者移除出stack的过程。
 type elemRef struct {
-	page  *page
-	node  *node
-	index int
+	page  *page // elemRef所代表的page引用
+	node  *node // elemRef所代表的node引用
+	index int // page或node中元素的索引
 }
 
 // isLeaf returns whether the ref is pointing at a leaf page/node.

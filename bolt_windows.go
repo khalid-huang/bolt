@@ -95,6 +95,9 @@ func funlock(db *DB) error {
 
 // mmap memory maps a DB's data file.
 // Based on: https://github.com/edsrzf/mmap-go
+// 在刚初始化的时候，sz=32k，但是一开始的db文件只有16k, 所以不同平台处理方式不同：
+// 在针对windows平台的实现中，在进行mmap映射之前都会通过ftruncate系统调用将文件大小调整为待映射的大小，
+// 而在linux/unix平台的实现中是直接进行mmap调用的：
 func mmap(db *DB, sz int) error {
 	if !db.readOnly {
 		// Truncate the database to the size of the mmap.

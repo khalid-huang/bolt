@@ -22,13 +22,21 @@ type txid uint64
 // are using them. A long running read transaction can cause the database to
 // quickly grow.
 type Tx struct {
+	// 是否是可读写的transaction
 	writable       bool
+	// 指示当前transaction是否被db托管，即通过db.Update()或者db.View()来写或者读数据库。BoltDB还支持直接调用Tx的相关方法进行读写，这时managed字段为false;
 	managed        bool
+	// 指向当前db对象
 	db             *DB
+	// transaction初始化时从db中读取到的meta信息
 	meta           *meta
+	// transaction的根bucket，所有的transaction均从根bucket开始查找
 	root           Bucket
+	// 当前transaction读或写的page
 	pages          map[pgid]*page
+	// 与transaction操作统计相关的page
 	stats          TxStats
+	// transaction在commit时的回调函数列表，按添加顺序顺序执行
 	commitHandlers []func()
 
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
@@ -37,6 +45,7 @@ type Tx struct {
 	// By default, the flag is unset, which works well for mostly in-memory
 	// workloads. For databases that are much larger than available RAM,
 	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
+	// 复制或移动数据库文件时，指定的文件打开模式
 	WriteFlag int
 }
 
@@ -46,15 +55,21 @@ func (tx *Tx) init(db *DB) {
 	tx.pages = nil
 
 	// Copy the meta page since it can be changed by the writer.
+	// 创建一个空的meta对象，用于初始化tx.meta,，然后将db的meta复制到刚创建的meta对象中(是拷贝)
 	tx.meta = &meta{}
+	// 这里是拷贝哪个meta呢？具体看meta()函数的内容
 	db.meta().copy(tx.meta)
 
 	// Copy over the root bucket.
+	// 创建一个Bucket，并将其设为根Bucket，同时用meta中保存的根Bucket的头部来初始化transaction的根Bucket头部
+	// Bucket包括头部(bucket)和一些正文字段，头部中包括了Bucket的根节点所在的页的页号和一个序列号
+	// 这里对tx.root的初始化主要就是将meta中存的根Bucket(它也是整个db的根Bucket)的头部(bucket)拷贝给当前transaction的根Bucket;
 	tx.root = newBucket(tx)
 	tx.root.bucket = &bucket{}
 	*tx.root.bucket = tx.meta.root
 
 	// Increment the transaction id and add a page cache for writable transactions.
+	// 如果是可读写的transaction，就将meta的txid加一，当可读写transaction commit后，meta就会更新到数据库文件中，数据库的修改版本号就增加了
 	if tx.writable {
 		tx.pages = make(map[pgid]*page)
 		tx.meta.txid += txid(1)
