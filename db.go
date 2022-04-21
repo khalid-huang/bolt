@@ -891,6 +891,8 @@ func (db *DB) meta() *meta {
 func (db *DB) allocate(count int) (*page, error) {
 	// Allocate a temporary buffer for the page.
 	var buf []byte
+	// 首先分配所需的缓存。这里有一个优化措施: 如果只需要一页缓存的话，并不直接进行内存分配，而是通过Go中的Pool缓冲池来分配，
+	// 以减小分配内存带来的时间开销。tx.write()中向磁盘写入脏页后，会将所有只占一个页框的脏页清空，并放入Pool缓冲池;
 	if count == 1 {
 		buf = db.pagePool.Get().([]byte)
 	} else {
@@ -900,13 +902,25 @@ func (db *DB) allocate(count int) (*page, error) {
 	p.overflow = uint32(count - 1)
 
 	// Use pages from the freelist if they are available.
+	// 从freeList查看有没有可用的页号，如果有则分配给刚刚申请到的页缓存，并返回；如果freeList中没有可用的页号，
+	// 则说明当前映射入内存的文件段没有空闲页，需要增大文件映射范围;
 	if p.id = db.freelist.allocate(count); p.id != 0 {
 		return p, nil
 	}
 
 	// Resize mmap() if we're at the end.
+	// 将新申请的页缓存的页号设为文件内容结尾处的页号; 请注意，我们所说的文件内容结尾处并不是指文件结尾处，如大小为32K 的文件，
+	// 只写入了4页(页大小为4K)，则文件内容结尾处为16K处，结尾处的页号是4。
+	// meta.pgid简单理解为文件总页数，实际上并不准确，我们说简单理解为文件总页数，是假设文件被写满(如刚创建DB文件时)的情况。现在我们知道，
+	// 映射文件大小大于16M时，文件实际大小会大于文件内容长度。实际上，BoltDB允许在Open()的时候指定初始的文件映射长度，并可以超过文件大小，
+	// 在linux平台上，在读写transaction commit之前，映射区长度均会大于文件实际大小，但meta.pgid总是记录文件内容所占的最大页号加1;
 	p.id = db.rwtx.meta.pgid
+	// 计算需要的总页数
 	var minsz = int((p.id+pgid(count))+1) * db.pageSize
+	// 如果需要的页数大于已经映射到内存的文件总页数，则触发remmap，将映射区域扩大到写入文件后新的文件内容结尾处。
+	// 我们前面介绍db.mmaplock的时候说过，读写transaction在remmap时，需要等待所有已经open的只读transaction结束，
+	// 从这里我们知道，如果打开DB文件时，设定的初始文件映射长度足够长，可以减少读写transaction需要remmap的概率，
+	// 从而降低读写transaction被阻塞的概率，提高读写并发;
 	if minsz >= db.datasz {
 		if err := db.mmap(minsz); err != nil {
 			return nil, fmt.Errorf("mmap allocate error: %s", err)
@@ -914,6 +928,7 @@ func (db *DB) allocate(count int) (*page, error) {
 	}
 
 	// Move the page id high water mark.
+	// meta.pgid指向新的文件内容结尾处;
 	db.rwtx.meta.pgid += pgid(count)
 
 	return p, nil

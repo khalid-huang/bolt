@@ -228,6 +228,8 @@ func (tx *Tx) Commit() error {
 	// Write dirty pages to disk.
 	startTime = time.Now()
 	// 将当前transaction分配的脏页写入磁盘
+	// 对Bucket进行rebalance和spill后，Bucket及其子Bucket对应的B+Tree将处于平衡状态，随后各node将被写入DB文件。这两个过程在树结构上进行递归
+	// 接下来就是tx.write和tx.writeMeta了
 	if err := tx.write(); err != nil {
 		tx.rollback()
 		return err
@@ -489,6 +491,8 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
+// 分配页缓冲
+// 它实际上是通过DB的allocate()方法来做实际分配的；同时，这里分配的页缓存将被加入到tx的pages字段中，也就是我们前面提到的脏页集合
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
 	if err != nil {
@@ -508,15 +512,18 @@ func (tx *Tx) allocate(count int) (*page, error) {
 // write writes any dirty pages to disk.
 func (tx *Tx) write() error {
 	// Sort pages by id.
+	// 首先将当前tx中的脏页的引用保存到本地slice变量中，并释放原来的引用。请注意，Tx对象并不是线程安全的，而接下来的写文件操作会比较耗时，此时应该避免tx.pages被修改;
 	pages := make(pages, 0, len(tx.pages))
 	for _, p := range tx.pages {
 		pages = append(pages, p)
 	}
 	// Clear out page cache early.
+	// 对页按其pgid排序，保证在随后按页顺序写文件，一定程度上提高写文件效率
 	tx.pages = make(map[pgid]*page)
 	sort.Sort(pages)
 
 	// Write pages to disk in order.
+	// 开始将各页循环写入文件，循环体中通过fwrite系统调用写文件;
 	for _, p := range pages {
 		size := (int(p.overflow) + 1) * tx.db.pageSize
 		offset := int64(p.id) * int64(tx.db.pageSize)
@@ -552,6 +559,7 @@ func (tx *Tx) write() error {
 	}
 
 	// Ignore file sync if flag is set on DB.
+	// 通过fdatasync将磁盘缓冲写入磁盘
 	if !tx.db.NoSync || IgnoreNoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
@@ -578,6 +586,7 @@ func (tx *Tx) write() error {
 	return nil
 }
 
+// 先向临时分配的页缓存写入序列化后的meta页，然后通过fwrite和fdatesync系统调用将其写入DB的meta page。
 // writeMeta writes the meta to the disk.
 func (tx *Tx) writeMeta() error {
 	// Create a temporary buffer for the meta page.
