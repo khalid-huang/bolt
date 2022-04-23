@@ -113,6 +113,7 @@ func (tx *Tx) Stats() TxStats {
 // Returns nil if the bucket does not exist.
 // The bucket instance is only valid for the lifetime of the transaction.
 func (tx *Tx) Bucket(name []byte) *Bucket {
+	// 通过tx的根Bucket开始查找
 	return tx.root.Bucket(name)
 }
 

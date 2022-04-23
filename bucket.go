@@ -109,13 +109,21 @@ func (b *Bucket) Cursor() *Cursor {
 // Bucket retrieves a nested bucket by name.
 // Returns nil if the bucket does not exist.
 // The bucket instance is only valid for the lifetime of the transaction.
+// 可以看出，Bucket()方法查找子Bucket时进行了缓存，
+// 一方面可以加快后续的查找过程，另一方面只有缓存下来的子Bucket
+// 才在读写Transaction Commit时作再平衡和溢出处理。
+// 找到子Bucket后，就可以调用其Get()方法查找K/V记录，
+// 请注意，在只读Transaction中调用Bucket的CreateBucket()或者
+// Put()方法将会返回错误。
 func (b *Bucket) Bucket(name []byte) *Bucket {
+	// 再父Bucket缓存的子Bucket中查找，若有则返回
 	if b.buckets != nil {
 		if child := b.buckets[string(name)]; child != nil {
 			return child
 		}
 	}
 
+	// 查找父Bucket的记录，看是否有目标名字的Bucket记录，如果没有再回返错误
 	// Move cursor to key.
 	c := b.Cursor()
 	k, v, flags := c.seek(name)
@@ -126,6 +134,7 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	}
 
 	// Otherwise create a bucket and cache it.
+	// 将查找到的Bucket记录的Value传入openBucket()得到子Bucket
 	var child = b.openBucket(v)
 	if b.buckets != nil {
 		b.buckets[string(name)] = child
@@ -137,6 +146,7 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 // Helper method that re-interprets a sub-bucket value
 // from a parent into a Bucket
 func (b *Bucket) openBucket(value []byte) *Bucket {
+	// 创建一个Bucket
 	var child = newBucket(b.tx)
 
 	// If unaligned load/stores are broken on this arch and value is
@@ -149,6 +159,10 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 
 	// If this is a writable transaction then we need to copy the bucket entry.
 	// Read-only transactions can point directly at the mmap entry.
+	// 在读写Transaction中，将Value深度拷贝到新Bucket的头部；
+	// 在只读Transaction，将新Bucket的头部指向Value即可；
+	// 前面我们介绍过，普通Bucket记录的Value就是Bucket头部，
+	// 内置Bucket记录的Value是Bucket头和内置page的序列化结果;
 	if b.tx.writable && !unaligned {
 		child.bucket = &bucket{}
 		*child.bucket = *(*bucket)(unsafe.Pointer(&value[0]))
@@ -157,6 +171,7 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	}
 
 	// Save a reference to the inline page if the bucket is inline.
+	// 如果是一个内置Bucket，将新Bucket的page字段指向Value中内置page的起始位置
 	if child.root == 0 {
 		child.page = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
 	}
@@ -290,6 +305,7 @@ func (b *Bucket) DeleteBucket(key []byte) error {
 // Get retrieves the value for a key in the bucket.
 // Returns a nil value if the key does not exist or if the key is a nested bucket.
 // The returned value is only valid for the life of the transaction.
+// 其中核心的调用还是seek()方法，如果找到的是Bucket将返回nil，因为子Bucket只能通过Bucket()方法查找到
 func (b *Bucket) Get(key []byte) []byte {
 	k, v, flags := b.Cursor().seek(key)
 

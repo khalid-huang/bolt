@@ -671,6 +671,11 @@ func (db *DB) Update(fn func(*Tx) error) error {
 // Any error that is returned from the function is returned from the View() method.
 //
 // Attempting to manually rollback within the function will cause a panic.
+// 其过程与db.Update()相似，开始调用db.Begin(false)创建了一个只读的Transaction，
+// 与db.Update()不同的是，db.View()最后不需要调用Commit()，而且是通过调用t.Rollback()
+// 来结束Transaction的。由于只读Transaction并不能修改BoltDB，t.Rollback()实际上是释放mmaplock读锁并从
+// db.txs中移除当前transaction。
+// 在只读Transaction中，主要的操作就是查找Bucket或者K/V记录
 func (db *DB) View(fn func(*Tx) error) error {
 	t, err := db.Begin(false)
 	if err != nil {
