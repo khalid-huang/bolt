@@ -14,11 +14,12 @@ const minKeysPerPage = 2
 const branchPageElementSize = int(unsafe.Sizeof(branchPageElement{}))
 const leafPageElementSize = int(unsafe.Sizeof(leafPageElement{}))
 
+// page页的类型
 const (
-	branchPageFlag   = 0x01
-	leafPageFlag     = 0x02
-	metaPageFlag     = 0x04
-	freelistPageFlag = 0x10
+	branchPageFlag   = 0x01 // 存储B+树所有节点
+	leafPageFlag     = 0x02 // 存储B+树数据节点
+	metaPageFlag     = 0x04 // 存储meta元数据的页面
+	freelistPageFlag = 0x10 // 管理页面数据的页面
 )
 
 const (
