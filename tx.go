@@ -22,13 +22,21 @@ type txid uint64
 // are using them. A long running read transaction can cause the database to
 // quickly grow.
 type Tx struct {
+	// 是否是可读写的transaction
 	writable       bool
+	// 指示当前transaction是否被db托管，即通过db.Update()或者db.View()来写或者读数据库。BoltDB还支持直接调用Tx的相关方法进行读写，这时managed字段为false;
 	managed        bool
+	// 指向当前db对象
 	db             *DB
+	// transaction初始化时从db中读取到的meta信息
 	meta           *meta
+	// transaction的根bucket，所有的transaction均从根bucket开始查找
 	root           Bucket
+	// 当前transaction读或写的page
 	pages          map[pgid]*page
+	// 与transaction操作统计相关的page
 	stats          TxStats
+	// transaction在commit时的回调函数列表，按添加顺序顺序执行
 	commitHandlers []func()
 
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
@@ -37,6 +45,7 @@ type Tx struct {
 	// By default, the flag is unset, which works well for mostly in-memory
 	// workloads. For databases that are much larger than available RAM,
 	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
+	// 复制或移动数据库文件时，指定的文件打开模式
 	WriteFlag int
 }
 
@@ -46,15 +55,21 @@ func (tx *Tx) init(db *DB) {
 	tx.pages = nil
 
 	// Copy the meta page since it can be changed by the writer.
+	// 创建一个空的meta对象，用于初始化tx.meta,，然后将db的meta复制到刚创建的meta对象中(是拷贝)
 	tx.meta = &meta{}
+	// 这里是拷贝哪个meta呢？具体看meta()函数的内容
 	db.meta().copy(tx.meta)
 
 	// Copy over the root bucket.
+	// 创建一个Bucket，并将其设为根Bucket，同时用meta中保存的根Bucket的头部来初始化transaction的根Bucket头部
+	// Bucket包括头部(bucket)和一些正文字段，头部中包括了Bucket的根节点所在的页的页号和一个序列号
+	// 这里对tx.root的初始化主要就是将meta中存的根Bucket(它也是整个db的根Bucket)的头部(bucket)拷贝给当前transaction的根Bucket;
 	tx.root = newBucket(tx)
 	tx.root.bucket = &bucket{}
 	*tx.root.bucket = tx.meta.root
 
 	// Increment the transaction id and add a page cache for writable transactions.
+	// 如果是可读写的transaction，就将meta的txid加一，当可读写transaction commit后，meta就会更新到数据库文件中，数据库的修改版本号就增加了
 	if tx.writable {
 		tx.pages = make(map[pgid]*page)
 		tx.meta.txid += txid(1)
@@ -153,6 +168,8 @@ func (tx *Tx) Commit() error {
 
 	// Rebalance nodes which have had deletions.
 	var startTime = time.Now()
+	// 对根Bucket进行再平衡，这里的根Bucket也是整个DB的根Bucket，然而从根Bucket进行再平衡并不是要对DB中所有节点进行操作，
+	// 而且对当前读写Transaction访问过的Bucket中的有删除操作的节点进行再平衡
 	tx.root.rebalance()
 	if tx.stats.Rebalance > 0 {
 		tx.stats.RebalanceTime += time.Since(startTime)
@@ -160,6 +177,7 @@ func (tx *Tx) Commit() error {
 
 	// spill data onto dirty pages.
 	startTime = time.Now()
+	// 对根Bucket进行溢出操作，同样地，也是对访问过的子Bucket进行溢出操作，而且只有当节点中Key数量确实超限时才会分裂节点
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
 		return err
@@ -167,12 +185,15 @@ func (tx *Tx) Commit() error {
 	tx.stats.SpillTime += time.Since(startTime)
 
 	// Free the old root bucket.
+	// 进行在平衡与分裂后，根Bucket的根节点可能发送了变化，所以需要更新下根Bucket的根节点的页号，且最终会写入DB的meta page
 	tx.meta.root.root = tx.root.root
 
-	opgid := tx.meta.pgid
+	opgid := tx.meta.pgid // (4)
 
-	// Free the freelist and allocate new pages for it. This will overestimate
-	// the size of the freelist but not underestimate the size (which would be bad).
+	// 下面的代码是更新DB的freeList Page；这里为什么对freelist做了释放后重新分配页并写入呢？
+	// 这是因为下面的tx.write写磁盘的时候，只会向磁盘写入由当前Transaction分配并写入过的页(脏页)，
+	// 由于freeList page最初是在db初始化过程中分配的页，如果不在Transaction内释放并重新分配，
+	// 那么freeList page将没有机会被更新到DB文件中，这里的实现并不很优雅
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -185,9 +206,20 @@ func (tx *Tx) Commit() error {
 	}
 	tx.meta.freelist = p.id
 
+	// 这里的代码4,7,8是为了实现如下的逻辑：只有当映射入内存的页数增加时，才调用db.grow()来刷新磁盘文件的元数据，以及时更新文件大小信息。
+	// 这里需要解释一下: 我们前面介绍过，windows平台下db.mmap()调用会通过ftruncate系统调用来增加文件大小，而linux平台则没有，
+	// 但linux平台会在db.grow()中调用ftruncate更新文件大小。我们前面介绍过，BoltDB写数据时不是通过mmap内存映射写文件的，
+	// 而是直接通过fwrite和fdatesync系统调用 向文件系统写文件。当向文件写入数据时，文件系统上该文件结点的元数据可能不会立即刷新，
+	// 导致文件的size不会立即更新，当进程crash时，可能会出现写文件结束但文件大小没有更新的情况，所以为了防止这种情况出现，在写DB文件之前，
+	// 无论是windows还是linux平台，都会通过ftruncate系统调用来增加文件大小；但是linux平台为什么不在每次mmap的时候调用ftruncate来更新文件大小呢？
+	// 这里是一个优化措施，因为频繁地ftruncate系统调用会影响性能，这里的优化方式是: 只有当：1) 重新分配freeListPage时，没有空闲页，
+	// 这里大家可能会有疑惑，freeListPage不是刚刚通过freelist的free()方法释放过它所占用的页吗，还会有重新分配时没有空闲页的情况吗？
+	// 实际上，free()过并不是真正释放页，而是将页标记为pending，要等创建下一次读写Transaction时才会被真正回收(大家可以查看freeist的free()
+	// 和release()以及DB的beginRWTx()方法中最后一节代码了解具体逻辑)；2) remmap的长度大于文件实际大小时，才会调用ftruncate来增加文件大小，
+	// 且当映射文件大小大于16M后，每次增加文件大小时会比实际需要的文件大小多增加16M
 	// If the high water mark has moved up then attempt to grow the database.
-	if tx.meta.pgid > opgid {
-		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil {
+	if tx.meta.pgid > opgid { // (7)
+		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil { // (8)
 			tx.rollback()
 			return err
 		}
@@ -195,6 +227,9 @@ func (tx *Tx) Commit() error {
 
 	// Write dirty pages to disk.
 	startTime = time.Now()
+	// 将当前transaction分配的脏页写入磁盘
+	// 对Bucket进行rebalance和spill后，Bucket及其子Bucket对应的B+Tree将处于平衡状态，随后各node将被写入DB文件。这两个过程在树结构上进行递归
+	// 接下来就是tx.write和tx.writeMeta了
 	if err := tx.write(); err != nil {
 		tx.rollback()
 		return err
@@ -218,6 +253,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	// Write meta to disk.
+	// 将当前transaction的meta写入DB的meta页，因为进行读写操作后，meta中的txid已经改变，root、freelist和pgid也有可能已经更新了;
 	if err := tx.writeMeta(); err != nil {
 		tx.rollback()
 		return err
@@ -228,6 +264,7 @@ func (tx *Tx) Commit() error {
 	tx.close()
 
 	// Execute commit handlers now that the locks have been removed.
+	// 回调commit handlers
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}
@@ -454,6 +491,8 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
+// 分配页缓冲
+// 它实际上是通过DB的allocate()方法来做实际分配的；同时，这里分配的页缓存将被加入到tx的pages字段中，也就是我们前面提到的脏页集合
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
 	if err != nil {
@@ -473,15 +512,18 @@ func (tx *Tx) allocate(count int) (*page, error) {
 // write writes any dirty pages to disk.
 func (tx *Tx) write() error {
 	// Sort pages by id.
+	// 首先将当前tx中的脏页的引用保存到本地slice变量中，并释放原来的引用。请注意，Tx对象并不是线程安全的，而接下来的写文件操作会比较耗时，此时应该避免tx.pages被修改;
 	pages := make(pages, 0, len(tx.pages))
 	for _, p := range tx.pages {
 		pages = append(pages, p)
 	}
 	// Clear out page cache early.
+	// 对页按其pgid排序，保证在随后按页顺序写文件，一定程度上提高写文件效率
 	tx.pages = make(map[pgid]*page)
 	sort.Sort(pages)
 
 	// Write pages to disk in order.
+	// 开始将各页循环写入文件，循环体中通过fwrite系统调用写文件;
 	for _, p := range pages {
 		size := (int(p.overflow) + 1) * tx.db.pageSize
 		offset := int64(p.id) * int64(tx.db.pageSize)
@@ -517,6 +559,7 @@ func (tx *Tx) write() error {
 	}
 
 	// Ignore file sync if flag is set on DB.
+	// 通过fdatasync将磁盘缓冲写入磁盘
 	if !tx.db.NoSync || IgnoreNoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
@@ -543,6 +586,7 @@ func (tx *Tx) write() error {
 	return nil
 }
 
+// 先向临时分配的页缓存写入序列化后的meta页，然后通过fwrite和fdatesync系统调用将其写入DB的meta page。
 // writeMeta writes the meta to the disk.
 func (tx *Tx) writeMeta() error {
 	// Create a temporary buffer for the meta page.

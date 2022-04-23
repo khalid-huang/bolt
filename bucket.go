@@ -34,11 +34,17 @@ const DefaultFillPercent = 0.5
 
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
-	*bucket  // 在内联时bucket主要用来存储其桶的value并在后面拼接所有的元素，即所谓的内联
+	// Bucket的头，其中的root是Bucket根节点的页号，sequence是一个序列号，用于Bucket的序号生成器
+	*bucket
+	// tx: 当前Bucket所属的Transaction。请注意，Transaction与Bucket均是动态的概念，即内存中的对象，Bucket最终表示为BoltDB中的K/V记录
 	tx       *Tx                // the associated transaction
 	buckets  map[string]*Bucket // subbucket cache
+	// 内置(inline)Bucket的页引用，内置Bucket只有一个节点，就是根节点，且节点不存在独立的页面中，而是作为Bucket的Value存在父Bucket所在页上，页引用就是指向Value中的内置页
+	// 内存占用少的时候就不展开
 	page     *page              // inline page reference
+	// Bucket的根节点，也就是对于B+Tree的根节点
 	rootNode *node              // materialized node for the root page.
+	// bucket中的node集合
 	nodes    map[pgid]*node     // node cache
 
 	// Sets the threshold for filling nodes when they split. By default,
@@ -46,6 +52,9 @@ type Bucket struct {
 	// amount if you know that your write workloads are mostly append-only.
 	//
 	// This is non-persisted across transactions so it must be set in every Tx.
+	// Bucket中节点的填充百分比(或者占空比)。该值与B+Tree中节点的分裂有关系，当节点中Key的个数或者size超过整个node容量的某个百分比后，
+	// 节点必须分裂为两个节点，这是为了防止B+Tree中插入K/V时引发频繁的再平衡操作，所以注释中提到只有当确定大数多写入操作是向尾添加时，
+	// 这个值调大才有帮助。该值的默认值是50%;
 	FillPercent float64
 }
 
@@ -158,6 +167,11 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 // CreateBucket creates a new bucket at the given key and returns the new bucket.
 // Returns an error if the key already exists, if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
+// 整个Bucket的创建流程：
+// 	1. 根据Bucket的名字(key)搜索父Bucket（最初始的就是根Bucket），以确定表示Bucket的K/V对的插入位置;
+//	2. 创建空的内置Bucket，并将它序列化成byte slice，以作为Bucket的Value;
+//	3. 将表示Bucket的K/V对(即inode的flags为bucketLeafFlag(0x01))写入父Bucket的叶子节点;
+//	4. 通过Bucket的Bucket(name []byte)在父Bucket中查找刚刚创建的子Bucket，在了解了Bucket通过Cursor进行查找和遍历的过程后，读者可以尝试自行分析这一过程，我们在后续文中还会介绍Bucket的Get()方法，与此类似。
 func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	if b.tx.db == nil {
 		return nil, ErrTxClosed
@@ -168,7 +182,10 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	}
 
 	// Move cursor to correct position.
+	// 为当前Bucket创建游标
 	c := b.Cursor()
+	// 查找Key并移动游标，确定其应该插入的位置
+	// 在查找结束后，如果未找到key，即key指向叶子结点的结尾处，则它返回空；如果找到则返回K/V对。需要注意的是，在再次调用Cursor的seek()方法移动游标之前，游标一直位于上次seek()调用后的位置。
 	k, _, flags := c.seek(key)
 
 	// Return an error if there is an existing key.
@@ -179,21 +196,27 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		return nil, ErrIncompatibleValue
 	}
 
+	// 创建了一个内置的子Bucket，它的Bucket头bucket中的root为0
 	// Create empty, inline bucket.
 	var bucket = Bucket{
 		bucket:      &bucket{},
 		rootNode:    &node{isLeaf: true},
 		FillPercent: DefaultFillPercent,
 	}
+	// 通过Bucket的write方法将内置Bucket序列化，我们可以通过它了解内置Bucket式如何作为Value存在于页上的
 	var value = bucket.write()
 
 	// Insert into node.
+	// 内置Bucket就是将Bucket头和其根节点作为Value存于页框上，而其头中字段均为0
 	key = cloneBytes(key)
+	// 将刚创建的子Bucket插入游标位置
+	// 将内容写入
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
 	// Since subbuckets are not allowed on inline buckets, we need to
 	// dereference the inline page, if it exists. This will cause the bucket
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
+	// 因为当前Bucket包含了刚创建的子Bucket，它不会是内置Bucket;
 	b.page = nil
 
 	return b.Bucket(key), nil
@@ -202,6 +225,10 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist and returns a reference to it.
 // Returns an error if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
+// 向Bucket添加K/V的过程与创建Bucket时的过程极其相似，因为创建Bucket实际上就是向父Bucket添加一个标识为Bucket的K/V对而已。
+// 不同的是，这里作了一个保护，即当欲插入的Key与当前Bucket中已有的一个子Bucket的Key相同时，会拒绝写入，
+// 从而保护嵌套的子Bucket的引用不会被擦除，防止子Bucket变成孤儿。当然，我们也可以调用新创建的子Bucket的CreateBucket()方法来创建
+// 孙Bucket，然后向孙Bucket中写入K/V对，其过程与我们上述从根Bucket创建子Bucket的过程是一致的
 func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
 	child, err := b.CreateBucket(key)
 	if err == ErrBucketExists {
@@ -522,22 +549,28 @@ func (b *Bucket) _forEachPageNode(pgid pgid, depth int, fn func(*page, *node, in
 	}
 }
 
+// 在rebalance过程中，节点合并后其大小可能超过页大小，在spill过程中，超过页大小的节点会进行分裂
 // spill writes all the nodes for this bucket to dirty pages.
 func (b *Bucket) spill() error {
 	// Spill all child buckets first.
+	// 对Bucket树的子Bucket进行深度优先访问并递归调用spill
 	for name, child := range b.buckets {
 		// If the child bucket is small enough and it has no child buckets then
 		// write it inline into the parent bucket's page. Otherwise spill it
 		// like a normal bucket and make the parent value a pointer to the page.
 		var value []byte
 		if child.inlineable() {
+			// 如果一个普通的子Bucket由于K/V记录减少而满足了inlineable()条件时，它将变成一个内置Bucket，即它的B+Tree只有一个根节点，并将根节点上的所有inodes作为Value写入父Bucket;
 			child.free()
 			value = child.write()
 		} else {
+			// 子Bucket不满足inlineable()条件时，如果子Bucket原来是一个内置Bucket，则它将通过spill()变成一个普通的Bucket，
+			// 即它的B+Tree有一个根节点和至少两个叶子节点；如果子Bucket原本是一个普通Bucket，则spill()可能会更新它的根节点
 			if err := child.spill(); err != nil {
 				return err
 			}
 
+			// 一个普通的子Bucket的Value只保存了Bucket的头部。
 			// Update the child bucket header in this bucket.
 			value = make([]byte, unsafe.Sizeof(bucket{}))
 			var bucket = (*bucket)(unsafe.Pointer(&value[0]))
@@ -558,6 +591,8 @@ func (b *Bucket) spill() error {
 		if flags&bucketLeafFlag == 0 {
 			panic(fmt.Sprintf("unexpected bucket header flag: %x", flags))
 		}
+
+		// 将子Bucket的新的Value更新到父Bucket中
 		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
@@ -567,15 +602,19 @@ func (b *Bucket) spill() error {
 	}
 
 	// Spill nodes.
+	// 更新完子Bucket后，就开始spill自己，从当前Bucket的根节点处开始spill。在递归的最内层调用中，
+	// 访问到了Bucket树的某个(逻辑)叶子Bucket，由于它没有子Bucket，将直接从其根节开始spill;
 	if err := b.rootNode.spill(); err != nil {
 		return err
 	}
+	// Bucket spill后，其根节点可能会有变化，代码8处更新根节点应用
 	b.rootNode = b.rootNode.root()
 
 	// Update the root node for this bucket.
 	if b.rootNode.pgid >= b.tx.meta.pgid {
 		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.pgid))
 	}
+	// 更新Bucket头中的根节点页号
 	b.root = b.rootNode.pgid
 
 	return nil
@@ -583,6 +622,7 @@ func (b *Bucket) spill() error {
 
 // inlineable returns true if a bucket is small enough to be written inline
 // and if it contains no subbuckets. Otherwise returns false.
+// 只有当Bucket只有一个叶子节点(即其根节点)且它序列化后的大小小于页大小的25%时才能成为内置Bucket。
 func (b *Bucket) inlineable() bool {
 	var n = b.rootNode
 
@@ -629,6 +669,7 @@ func (b *Bucket) write() []byte {
 	return value
 }
 
+// 先对Bucket中缓存的node进行再平衡操作，然后对所有子Bucket递归调用rebalance()
 // rebalance attempts to balance all nodes.
 func (b *Bucket) rebalance() {
 	for _, n := range b.nodes {
@@ -700,6 +741,9 @@ func (b *Bucket) dereference() {
 	}
 }
 
+// Bucket的pageNode()方法的思想是: 从Bucket缓存的nodes中查找对应pgid的node，若有则返回node，page为空；若未找到，
+// 再从Bucket所属的Transaction申请过的page的集合(Tx的pages字段)中查找，有则返回该page，node为空；
+// 若Transaction中的page缓存中仍然没有，则直接从DB的内存映射中查找该页，并返回。总之，pageNode()就是根据pgid找到node或者page。
 // pageNode returns the in-memory node, if it exists.
 // Otherwise returns the underlying page.
 func (b *Bucket) pageNode(id pgid) (*page, *node) {
